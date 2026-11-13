@@ -15,7 +15,9 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
@@ -41,7 +43,6 @@ class MainActivity : AppCompatActivity() {
     private var pendingPhotoFile: File? = null
     private var pendingPhotoUri: Uri? = null
 
-    // 复用扫描器，避免每次拍照都重新加载模型
     private val scanner: BarcodeScanner by lazy {
         BarcodeScanning.getClient(
             BarcodeScannerOptions.Builder()
@@ -69,18 +70,27 @@ class MainActivity : AppCompatActivity() {
             pendingPhotoFile = null
 
             if (result.resultCode == Activity.RESULT_OK && uri != null) {
-                processImage(uri, file)
+                processImages(listOf(uri)) {
+                    file?.delete()
+                }
             } else {
                 statusText.text = "已取消拍照"
                 file?.delete()
             }
         }
 
+    private val pickImagesLauncher =
+        registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(20)) { uris ->
+            if (uris.isNotEmpty()) {
+                processImages(uris) { }
+            } else {
+                statusText.text = "未选择图片"
+            }
+        }
+
     private val createCsvLauncher =
         registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
-            if (uri != null) {
-                writeCsv(uri)
-            }
+            if (uri != null) writeCsv(uri)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,12 +101,20 @@ class MainActivity : AppCompatActivity() {
         emptyView = findViewById(R.id.emptyView)
 
         val recyclerView = findViewById<RecyclerView>(R.id.recyclerView)
-        adapter = BarcodeAdapter(barcodes)
+        adapter = BarcodeAdapter(barcodes) { position ->
+            showDeleteDialog(position)
+        }
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
 
         findViewById<Button>(R.id.takePhotoButton).setOnClickListener {
             openCamera()
+        }
+
+        findViewById<Button>(R.id.pickImagesButton).setOnClickListener {
+            pickImagesLauncher.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            )
         }
 
         findViewById<Button>(R.id.exportButton).setOnClickListener {
@@ -108,10 +126,18 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.clearButton).setOnClickListener {
-            barcodes.clear()
-            adapter.notifyDataSetChanged()
-            updateEmptyState()
-            statusText.text = "已清空"
+            if (barcodes.isEmpty()) return@setOnClickListener
+            AlertDialog.Builder(this)
+                .setTitle("清空全部记录？")
+                .setMessage("将删除 ${barcodes.size} 条记录，不可恢复。")
+                .setPositiveButton("清空") { _, _ ->
+                    barcodes.clear()
+                    adapter.notifyDataSetChanged()
+                    updateEmptyState()
+                    statusText.text = "已清空"
+                }
+                .setNegativeButton("取消", null)
+                .show()
         }
 
         updateEmptyState()
@@ -143,16 +169,48 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun processImage(uri: Uri, sourceFile: File?) {
-        statusText.text = "正在识别图片中的条形码…"
+    private fun showDeleteDialog(position: Int) {
+        if (position < 0 || position >= barcodes.size) return
+        val item = barcodes[position]
+        AlertDialog.Builder(this)
+            .setTitle("删除这条记录？")
+            .setMessage(item.content)
+            .setPositiveButton("删除") { _, _ ->
+                barcodes.removeAt(position)
+                adapter.notifyItemRemoved(position)
+                adapter.notifyItemRangeChanged(position, barcodes.size - position)
+                updateEmptyState()
+                statusText.text = "已删除 1 条，剩余 ${barcodes.size} 条"
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
 
-        // 解码和旋转放到后台线程，避免卡 UI
+    private fun processImages(uris: List<Uri>, onAllDone: () -> Unit) {
+        if (uris.isEmpty()) {
+            onAllDone()
+            return
+        }
+        val queue = uris.toMutableList()
+        fun processNext() {
+            if (queue.isEmpty()) {
+                onAllDone()
+                return
+            }
+            val uri = queue.removeAt(0)
+            processSingleImage(uri) { processNext() }
+        }
+        processNext()
+    }
+
+    private fun processSingleImage(uri: Uri, onDone: () -> Unit) {
+        statusText.text = "正在识别图片中的条形码…"
         Thread {
             try {
                 val bitmap = decodeSampledBitmap(uri, 1600)
                 if (bitmap == null) {
                     runOnUiThread { statusText.text = "读取图片失败" }
-                    sourceFile?.delete()
+                    onDone()
                     return@Thread
                 }
 
@@ -161,43 +219,56 @@ class MainActivity : AppCompatActivity() {
 
                 scanner.process(image)
                     .addOnSuccessListener { detected ->
-                        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-                            .format(Date())
-
-                        val newItems = detected.mapNotNull { barcode ->
-                            val value = barcode.rawValue ?: return@mapNotNull null
-                            BarcodeItem(
-                                content = value,
-                                format = formatName(barcode.format),
-                                time = now
-                            )
-                        }
-
-                        if (newItems.isEmpty()) {
-                            statusText.text = "未识别到条形码，请靠近、对焦后重拍"
-                        } else {
-                            barcodes.addAll(newItems)
-                            adapter.notifyDataSetChanged()
-                            updateEmptyState()
-                            statusText.text = "本次识别到 ${newItems.size} 个，共 ${barcodes.size} 条"
-                        }
+                        handleDetected(detected)
                     }
                     .addOnFailureListener { e ->
                         statusText.text = "识别失败：${e.message}"
                     }
                     .addOnCompleteListener {
-                        sourceFile?.delete()
                         if (rotated !== bitmap) rotated.recycle()
                         bitmap.recycle()
+                        onDone()
                     }
             } catch (e: Exception) {
                 runOnUiThread { statusText.text = "读取图片失败：${e.message}" }
-                sourceFile?.delete()
+                onDone()
             }
         }.start()
     }
 
-    // 按最长边降采样到 maxDimension 像素，大幅减少解码和识别耗时
+    private fun handleDetected(detected: List<Barcode>) {
+        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
+        var total = 0
+        var added = 0
+        var duplicate = 0
+
+        detected.forEach { barcode ->
+            val value = barcode.rawValue ?: return@forEach
+            total++
+            if (barcodes.any { it.content == value }) {
+                duplicate++
+            } else {
+                barcodes.add(BarcodeItem(value, formatName(barcode.format), now))
+                added++
+            }
+        }
+
+        if (total == 0) {
+            statusText.text = "未识别到条形码，请靠近、对焦后重拍"
+            return
+        }
+
+        adapter.notifyDataSetChanged()
+        updateEmptyState()
+        val msg = buildString {
+            append("本次识别 $total 个")
+            if (added > 0) append("，新增 $added 个")
+            if (duplicate > 0) append("，跳过重复 $duplicate 个")
+            append("，累计 ${barcodes.size} 条")
+        }
+        statusText.text = msg
+    }
+
     private fun decodeSampledBitmap(uri: Uri, maxDimension: Int): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use {
@@ -218,7 +289,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 系统相机拍的照片可能带 EXIF 旋转，降采样后需要手动转正
     private fun rotateBitmapByExif(bitmap: Bitmap, uri: Uri): Bitmap {
         return try {
             val input = contentResolver.openInputStream(uri) ?: return bitmap
@@ -308,7 +378,8 @@ data class BarcodeItem(
 )
 
 class BarcodeAdapter(
-    private val items: List<BarcodeItem>
+    private val items: MutableList<BarcodeItem>,
+    private val onLongClick: (Int) -> Unit
 ) : RecyclerView.Adapter<BarcodeAdapter.ViewHolder>() {
 
     class ViewHolder(view: View) : RecyclerView.ViewHolder(view) {
@@ -330,6 +401,11 @@ class BarcodeAdapter(
         holder.contentText.text = item.content
         holder.formatText.text = item.format
         holder.timeText.text = item.time
+
+        holder.itemView.setOnLongClickListener {
+            onLongClick(position)
+            true
+        }
     }
 
     override fun getItemCount(): Int = items.size
