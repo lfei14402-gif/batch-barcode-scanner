@@ -3,6 +3,9 @@ package com.example.batchbarcodescanner
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -15,8 +18,11 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
+import androidx.exifinterface.media.ExifInterface
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
@@ -34,6 +40,26 @@ class MainActivity : AppCompatActivity() {
 
     private var pendingPhotoFile: File? = null
     private var pendingPhotoUri: Uri? = null
+
+    // 复用扫描器，避免每次拍照都重新加载模型
+    private val scanner: BarcodeScanner by lazy {
+        BarcodeScanning.getClient(
+            BarcodeScannerOptions.Builder()
+                .setBarcodeFormats(
+                    Barcode.FORMAT_EAN_13,
+                    Barcode.FORMAT_EAN_8,
+                    Barcode.FORMAT_UPC_A,
+                    Barcode.FORMAT_UPC_E,
+                    Barcode.FORMAT_CODE_128,
+                    Barcode.FORMAT_CODE_39,
+                    Barcode.FORMAT_QR_CODE,
+                    Barcode.FORMAT_DATA_MATRIX,
+                    Barcode.FORMAT_PDF417,
+                    Barcode.FORMAT_AZTEC
+                )
+                .build()
+        )
+    }
 
     private val takePictureLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -91,15 +117,16 @@ class MainActivity : AppCompatActivity() {
         updateEmptyState()
     }
 
+    override fun onDestroy() {
+        scanner.close()
+        super.onDestroy()
+    }
+
     private fun openCamera() {
         try {
             val dir = File(cacheDir, "images").apply { mkdirs() }
             val file = File.createTempFile("barcode_", ".jpg", dir)
-            val uri = FileProvider.getUriForFile(
-                this,
-                "$packageName.fileprovider",
-                file
-            )
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
 
             pendingPhotoFile = file
             pendingPhotoUri = uri
@@ -119,47 +146,101 @@ class MainActivity : AppCompatActivity() {
     private fun processImage(uri: Uri, sourceFile: File?) {
         statusText.text = "正在识别图片中的条形码…"
 
-        val scanner = BarcodeScanning.getClient()
-
-        try {
-            val image = InputImage.fromFilePath(this, uri)
-
-            scanner.process(image)
-                .addOnSuccessListener { detected ->
-                    val now = SimpleDateFormat(
-                        "yyyy-MM-dd HH:mm:ss",
-                        Locale.getDefault()
-                    ).format(Date())
-
-                    val newItems = detected.mapNotNull { barcode ->
-                        val value = barcode.rawValue ?: return@mapNotNull null
-                        BarcodeItem(
-                            content = value,
-                            format = formatName(barcode.format),
-                            time = now
-                        )
-                    }
-
-                    if (newItems.isEmpty()) {
-                        statusText.text = "未识别到条形码，请靠近、对焦后重拍"
-                    } else {
-                        barcodes.addAll(newItems)
-                        adapter.notifyDataSetChanged()
-                        updateEmptyState()
-                        statusText.text = "本次识别到 ${newItems.size} 个，共 ${barcodes.size} 条"
-                    }
-                }
-                .addOnFailureListener { e ->
-                    statusText.text = "识别失败：${e.message}"
-                }
-                .addOnCompleteListener {
-                    scanner.close()
+        // 解码和旋转放到后台线程，避免卡 UI
+        Thread {
+            try {
+                val bitmap = decodeSampledBitmap(uri, 1600)
+                if (bitmap == null) {
+                    runOnUiThread { statusText.text = "读取图片失败" }
                     sourceFile?.delete()
+                    return@Thread
                 }
+
+                val rotated = rotateBitmapByExif(bitmap, uri)
+                val image = InputImage.fromBitmap(rotated, 0)
+
+                scanner.process(image)
+                    .addOnSuccessListener { detected ->
+                        val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                            .format(Date())
+
+                        val newItems = detected.mapNotNull { barcode ->
+                            val value = barcode.rawValue ?: return@mapNotNull null
+                            BarcodeItem(
+                                content = value,
+                                format = formatName(barcode.format),
+                                time = now
+                            )
+                        }
+
+                        if (newItems.isEmpty()) {
+                            statusText.text = "未识别到条形码，请靠近、对焦后重拍"
+                        } else {
+                            barcodes.addAll(newItems)
+                            adapter.notifyDataSetChanged()
+                            updateEmptyState()
+                            statusText.text = "本次识别到 ${newItems.size} 个，共 ${barcodes.size} 条"
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        statusText.text = "识别失败：${e.message}"
+                    }
+                    .addOnCompleteListener {
+                        sourceFile?.delete()
+                        if (rotated !== bitmap) rotated.recycle()
+                        bitmap.recycle()
+                    }
+            } catch (e: Exception) {
+                runOnUiThread { statusText.text = "读取图片失败：${e.message}" }
+                sourceFile?.delete()
+            }
+        }.start()
+    }
+
+    // 按最长边降采样到 maxDimension 像素，大幅减少解码和识别耗时
+    private fun decodeSampledBitmap(uri: Uri, maxDimension: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > maxDimension ||
+            bounds.outHeight / sampleSize > maxDimension
+        ) {
+            sampleSize *= 2
+        }
+
+        val opts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        return contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, opts)
+        }
+    }
+
+    // 系统相机拍的照片可能带 EXIF 旋转，降采样后需要手动转正
+    private fun rotateBitmapByExif(bitmap: Bitmap, uri: Uri): Bitmap {
+        return try {
+            val input = contentResolver.openInputStream(uri) ?: return bitmap
+            val exif = ExifInterface(input)
+            val orientation = exif.getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
+            input.close()
+
+            val matrix = Matrix()
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+                ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+                ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+                else -> return bitmap
+            }
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         } catch (e: Exception) {
-            statusText.text = "读取图片失败：${e.message}"
-            sourceFile?.delete()
-            scanner.close()
+            bitmap
         }
     }
 
@@ -193,11 +274,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun csvEscape(value: String): String {
-        val needsQuote = value.contains(',') ||
-                value.contains('"') ||
-                value.contains('\n') ||
-                value.contains('\r')
-
+        val needsQuote = value.contains(',') || value.contains('"') ||
+                value.contains('\n') || value.contains('\r')
         val escaped = value.replace("\"", "\"\"")
         return if (needsQuote) "\"$escaped\"" else escaped
     }
