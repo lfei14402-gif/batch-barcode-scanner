@@ -19,6 +19,20 @@
             android:textSize="13sp" />
 
         <Button
+            android:id="@+id/pickImagesButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="相册选图"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
             android:id="@+id/exportButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
@@ -41,7 +55,7 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
         android:layout_marginBottom="8dp"
-        android:text="点击“拍照识别”拍摄包含多个条码的照片"
+        android:text="拍照或从相册选图，长按列表项可删除单条"
         android:textSize="13sp" />
 
     <LinearLayout
@@ -103,7 +117,7 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:gravity="center"
-            android:text="还没有识别结果\n拍照后结果会显示在这里"
+            android:text="还没有识别结果\n拍照或从相册选图后结果显示在这里"
             android:textSize="14sp" />
     </FrameLayout>
 
